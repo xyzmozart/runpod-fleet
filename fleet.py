@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+runpod-fleet — sewa & jaga pod RunPod otomatis (stdlib only, no deps).
+
+Commands:
+  templates   daftar template milik akun
+  pods        daftar pod
+  deploy      sewa N pod sekarang (sekali jalan)
+  rent        sewa + verifikasi + ganti pod jelek, sampai target GOOD
+  verify      cek semua pod RUNNING (logs + GPU util)
+  terminate   buang pod (by id / prefix / --bad)
+  logs        lihat logs 1 pod
+  stop        hentikan proses rent yang jalan di background
+
+Contoh:
+  python fleet.py templates --account main
+  python fleet.py rent --account main --count 10 --pick
+  python fleet.py verify --account main
+  python fleet.py terminate --account main --prefix prl- --only-bad
+  python fleet.py stop
+
+Semua opsi ditaruh DI BELAKANG subcommand.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+GRAPHQL = "https://api.runpod.io/graphql"
+DEFAULT_CONFIG = "config.json"
+
+# ---------------------------------------------------------------- config
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        sys.exit(
+            "Config tidak ditemukan: %s\n"
+            "Salin config.example.json -> config.json lalu isi API key." % path
+        )
+    with open(path) as f:
+        return json.load(f)
+
+
+def pick_template(cfg, key):
+    tmpls = gql(key, "{ myself { podTemplates { id name imageName } } }")[
+        "data"]["myself"]["podTemplates"]
+    for i, t in enumerate(tmpls, 1):
+        print("%3d. %-45s %s  (%s)" % (i, t["name"], t["id"], t["imageName"]))
+    ans = input("Pilih nomor template: ").strip()
+    try:
+        return tmpls[int(ans) - 1]["id"]
+    except (ValueError, IndexError):
+        sys.exit("Pilihan tidak valid.")
+
+
+# ---------------------------------------------------------------- api
+
+
+def gql(key, query, timeout=30):
+    req = urllib.request.Request(
+        GRAPHQL + "?api_key=" + key,
+        data=json.dumps({"query": query}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            # RunPod menolak User-Agent default Python
+            "User-Agent": "runpod-fleet/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"errors": [{"message": "HTTP %s: %s" % (e.code, e.read()[:200])}]}
+    if body.get("errors"):
+        # supply constraint dsb tetap dikembalikan sebagai data None
+        pass
+    return body
+
+
+def my_pods(key):
+    d = gql(key, "{ myself { pods { id name desiredStatus templateId } } }")
+    return d.get("data", {}).get("myself", {}).get("pods", []) or []
+
+
+def pod_runtime(key, pid):
+    d = gql(key, '{ pod(input:{podId:"%s"}) { runtime { uptimeInSeconds'
+            ' gpus { gpuUtilPercent } } } }' % pid)
+    try:
+        return d["data"]["pod"]["runtime"] or {}
+    except Exception:
+        return {}
+
+
+def pod_logs(key, pid, wait=15):
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "-N", "--max-time", str(wait),
+             "-H", "Authorization: Bearer " + key,
+             "https://api.runpod.io/v2/pods/%s/logs" % pid],
+            capture_output=True, text=True, timeout=wait + 15).stdout
+    except Exception:
+        return []
+    lines = []
+    for raw in out.splitlines():
+        if raw.startswith("data: ") and '"line"' in raw:
+            try:
+                lines.append(json.loads(raw[6:]).get("line", ""))
+            except Exception:
+                pass
+    return lines
+
+
+def deploy(key, tpl, args, name):
+    q = ('mutation { podFindAndDeployOnDemand(input: {'
+         'cloudType: %s, gpuCount: 1, gpuTypeId: "%s", name: "%s", '
+         'templateId: "%s", volumeInGb: 0, containerDiskInGb: %d, '
+         'minVcpuCount: %d, minMemoryInGb: %d, ports: "22/tcp"'
+         ') { id desiredStatus costPerHr } }' % (
+             args.cloud, args.gpu, name, tpl,
+             args.disk, args.min_vcpu, args.min_mem))
+    d = gql(key, q)
+    p = (d.get("data") or {}).get("podFindAndDeployOnDemand")
+    if p:
+        return p["id"], p.get("costPerHr")
+    errs = d.get("errors") or [{}]
+    return None, errs[0].get("extensions", {}).get("code", errs[0].get("message", "?"))
+
+
+def terminate(key, pid):
+    d = gql(key, 'mutation { podTerminate(input:{podId:"%s"}) }' % pid)
+    return not d.get("errors")
+
+
+# ---------------------------------------------------------------- verdict
+
+
+def classify(key, pid, args):
+    """GOOD | BAD | PENDING"""
+    lines = pod_logs(key, pid, wait=args.log_wait)
+    txt = "\n".join(lines)
+    for kw in args.bad_keywords:
+        if kw in txt:
+            return "BAD"
+    for kw in args.good_keywords:
+        if kw in txt:
+            return "GOOD"
+    if txt.count("exit code") >= 2:
+        return "BAD"
+    if not lines:
+        return "PENDING"
+    return "PENDING"
+
+
+def is_stale(key, pid, stale_seconds):
+    rt = pod_runtime(key, pid)
+    up = rt.get("uptimeInSeconds") or 0
+    utils = [g.get("gpuUtilPercent") for g in (rt.get("gpus") or [])]
+    return up > stale_seconds and utils and all((u or 0) < 5 for u in utils)
+
+
+def log(msg):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_templates(args, key, cfg):
+    d = gql(key, "{ myself { podTemplates { id name imageName containerDiskInGb } } }")
+    for t in d["data"]["myself"]["podTemplates"]:
+        print("%-12s %-45s %s" % (t["id"], t["name"], t["imageName"]))
+
+
+def cmd_pods(args, key, cfg):
+    pods = my_pods(key)
+    if not pods:
+        print("(tidak ada pod)")
+        return
+    for p in sorted(pods, key=lambda x: x["name"]):
+        print("%-24s %-18s %-9s %s" % (
+            p["name"], p["id"], p["desiredStatus"], p.get("templateId", "")))
+    from collections import Counter
+    print(dict(Counter(p["desiredStatus"] for p in pods)))
+
+
+def cmd_deploy(args, key, cfg):
+    tpl = args.template or cfg.get("template_id")
+    if not tpl:
+        sys.exit("Template belum di-set. Pakai --template ID, --pick, "
+                 "atau isi template_id di config.json.")
+    n = args.n or 1
+    ok = 0
+    for i in range(n):
+        name = "%s-%s" % (args.prefix, int(time.time()) % 100000 + i)
+        pid, info = deploy(key, tpl, args, name)
+        if pid:
+            ok += 1
+            log("DEPLOY %s (%s/hr)" % (pid, info))
+        else:
+            log("GAGAL: %s" % info)
+            if info == "SUPPLY_CONSTRAINT":
+                time.sleep(args.supply_wait)
+                # coba lagi
+                pid, info = deploy(key, tpl, args, name)
+                if pid:
+                    ok += 1
+                    log("DEPLOY %s (%s/hr)" % (pid, info))
+    log("selesai: %d/%d pod baru" % (ok, n))
+
+
+def cmd_verify(args, key, cfg):
+    pods = [p for p in my_pods(key) if p["desiredStatus"] == "RUNNING"]
+    if args.prefix:
+        pods = [p for p in pods if p["name"].startswith(args.prefix)]
+    results = {"GOOD": [], "BAD": [], "PENDING": []}
+
+    def check(p):
+        st = classify(key, p["id"], args)
+        rt = pod_runtime(key, p["id"])
+        util = [g.get("gpuUtilPercent") for g in (rt.get("gpus") or [])]
+        return p, st, util
+
+    with ThreadPoolExecutor(args.concurrency) as ex:
+        for p, st, util in ex.map(check, pods):
+            print("%-24s %-18s %-8s util=%s" % (p["name"], p["id"], st, util))
+            results[st].append(p)
+    print("\nGOOD=%d BAD=%d PENDING=%d TOTAL=%d" % (
+        len(results["GOOD"]), len(results["BAD"]),
+        len(results["PENDING"]), len(pods)))
+
+
+def cmd_terminate(args, key, cfg):
+    pods = my_pods(key)
+    targets = []
+    if args.ids:
+        targets = [{"id": i, "name": i} for i in args.ids]
+    else:
+        for p in pods:
+            if args.prefix and not p["name"].startswith(args.prefix):
+                continue
+            if args.only_bad and p["desiredStatus"] == "RUNNING":
+                if classify(key, p["id"], args) != "BAD":
+                    continue
+            targets.append(p)
+    for p in targets:
+        if terminate(key, p["id"]):
+            log("TERMINATE %s %s" % (p["id"], p["name"]))
+        else:
+            log("GAGAL terminate %s" % p["id"])
+    log("total dibuang: %d" % len(targets))
+
+
+def cmd_logs(args, key, cfg):
+    for l in pod_logs(key, args.pod_id, wait=args.log_wait):
+        print(l)
+
+
+def cmd_rent(args, key, cfg):
+    tpl = args.template or cfg.get("template_id")
+    if not tpl:
+        sys.exit("Template belum di-set. Pakai --template ID, --pick, "
+                 "atau isi template_id di config.json.")
+    target = args.count
+    prefix = args.prefix
+    counter = 0
+    log("rent dimulai: target=%d GOOD, template=%s, prefix=%s-%s" % (
+        target, tpl, prefix, args.tag))
+    write_pidfile(args)
+    try:
+        while True:
+            pods = [p for p in my_pods(key)
+                    if p["desiredStatus"] == "RUNNING"
+                    and p["name"].startswith(prefix + "-")]
+            good, bad, pending = [], [], []
+
+            def check(p):
+                return p, classify(key, p["id"], args)
+
+            with ThreadPoolExecutor(args.concurrency) as ex:
+                for p, st in ex.map(check, pods):
+                    log("CHECK %s %s -> %s" % (p["id"], p["name"], st))
+                    if st == "GOOD":
+                        good.append(p)
+                    elif st == "BAD":
+                        bad.append(p)
+                    else:
+                        if is_stale(key, p["id"], args.stale):
+                            log("  STALE -> BAD %s" % p["name"])
+                            bad.append(p)
+                        else:
+                            pending.append(p)
+            for p in bad:
+                terminate(key, p["id"])
+                log("TERMINATE %s %s" % (p["id"], p["name"]))
+            log("SUMMARY good=%d pending=%d bad=%d" % (
+                len(good), len(pending), len(bad)))
+            if len(good) >= target:
+                log("TARGET_REACHED (%d GOOD)" % len(good))
+                break
+            while len(good) + len(pending) < target and len(pending) < args.batch:
+                counter += 1
+                name = "%s-%s-%d" % (prefix, args.tag, counter)
+                pid, info = deploy(key, tpl, args, name)
+                if pid:
+                    log("DEPLOY %s %s (%s/hr)" % (pid, name, info))
+                    pending.append({"id": pid, "name": name})
+                else:
+                    log("wait[%s] %s" % (args.tag, info))
+                    if info != "SUPPLY_CONSTRAINT":
+                        log("  pesan: %s" % info)
+                    time.sleep(args.supply_wait)
+                    break
+            time.sleep(args.round_pause)
+    except KeyboardInterrupt:
+        log("dihentikan manual (Ctrl+C)")
+    finally:
+        remove_pidfile()
+
+
+# ---------------------------------------------------------------- pidfile
+
+
+def pidfile_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fleet.pid")
+
+
+def write_pidfile(args):
+    with open(pidfile_path(), "w") as f:
+        f.write(str(os.getpid()))
+
+
+def remove_pidfile():
+    try:
+        os.remove(pidfile_path())
+    except OSError:
+        pass
+
+
+def cmd_stop(args, key, cfg):
+    path = pidfile_path()
+    if not os.path.exists(path):
+        print("tidak ada proses rent yang terdaftar")
+        return
+    pid = int(open(path).read().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print("dihentikan pid %d" % pid)
+    except OSError as e:
+        print("gagal: %s" % e)
+    remove_pidfile()
+
+
+# ---------------------------------------------------------------- main
+
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=DEFAULT_CONFIG, help="path config.json")
+    common.add_argument("--account", help="nama akun di config (lihat 'accounts')")
+    common.add_argument("--key", help="API key RunPod (menimpa config)")
+    common.add_argument("--template", help="template ID")
+    common.add_argument("--pick", action="store_true",
+                        help="pilih template interaktif dari daftar")
+    common.add_argument("--gpu", help="gpuTypeId (default dari config)")
+    common.add_argument("--cloud", help="COMMUNITY / SECURE / ALL")
+    common.add_argument("--count", type=int, help="target jumlah pod GOOD")
+    common.add_argument("--prefix", help="prefix nama pod, mis. prl")
+    common.add_argument("--stale", type=int, dest="stale",
+                        help="detik sebelum pod tanpa GPU dianggap rusak")
+    common.add_argument("--batch", type=int, help="deploy per ronde")
+    common.add_argument("--disk", type=int, help="container disk GB")
+    common.add_argument("--min-vcpu", dest="min_vcpu", type=int)
+    common.add_argument("--min-mem", dest="min_mem", type=int)
+    common.add_argument("--log-wait", dest="log_wait", type=int, default=15)
+    common.add_argument("--concurrency", type=int, default=8)
+    common.add_argument("--supply-wait", dest="supply_wait", type=int, default=20)
+    common.add_argument("--round-pause", dest="round_pause", type=int, default=10)
+    common.add_argument("--good-kw", dest="good_kw",
+                        help="kata kunci GOOD dipisah koma, mis. 'TH/s,Accepted'")
+    common.add_argument("--bad-kw", dest="bad_kw",
+                        help="kata kunci BAD dipisah koma")
+    common.add_argument("--tag", default=time.strftime("%m%d"),
+                        help="label ronde, dipakai di nama pod")
+
+    ap = argparse.ArgumentParser(
+        description="runpod-fleet: sewa & jaga pod RunPod otomatis")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("templates", parents=[common])
+    sub.add_parser("pods", parents=[common])
+    p = sub.add_parser("deploy", parents=[common])
+    p.add_argument("-n", type=int, dest="n",
+                   help="jumlah pod yang disewa sekarang")
+    sub.add_parser("rent", parents=[common])
+    sub.add_parser("verify", parents=[common])
+    p = sub.add_parser("terminate", parents=[common])
+    p.add_argument("ids", nargs="*", help="pod ID (kosongkan = pakai filter)")
+    p.add_argument("--only-bad", action="store_true",
+                   dest="only_bad", help="hanya yang verdict BAD")
+    p = sub.add_parser("logs", parents=[common])
+    p.add_argument("pod_id")
+    sub.add_parser("stop", parents=[common])
+
+    args = ap.parse_args()
+    if args.cmd == "stop":
+        cmd_stop(args, None, {})  # stop tidak butuh config/API key
+        return
+    if os.path.exists(args.config):
+        cfg = load_config(args.config)
+    elif args.key:
+        cfg = {}  # config opsional kalau API key dikasih via --key
+    else:
+        sys.exit(
+            "Config tidak ditemukan: %s\n"
+            "Salin config.example.json -> config.json lalu isi API key, "
+            "atau pakai --key." % args.config
+        )
+
+    key = args.key or cfg.get("accounts", {}).get(
+        args.account or cfg.get("default_account", ""))
+    if not key:
+        sys.exit("API key tidak ada. Pakai --account NAMA, --key, "
+                 "atau isi config.json (accounts/default_account).")
+
+    for attr, ckey, dflt in [
+        ("gpu", "gpu_type_id", "NVIDIA GeForce RTX 5090"),
+        ("cloud", "cloud_type", "COMMUNITY"),
+        ("count", "count", 10),
+        ("prefix", "name_prefix", "prl"),
+        ("stale", "stale_seconds", 300),
+        ("batch", "deploys_per_round", 3),
+        ("disk", "container_disk_gb", 20),
+        ("min_vcpu", "min_vcpu", 4),
+        ("min_mem", "min_memory_gb", 16),
+        ("good_kw", "good_keywords", ["TH/s", "Accepted"]),
+        ("bad_kw", "bad_keywords",
+         ["Failed to find OpenCL platform", "clGetPlatformIDs"]),
+    ]:
+        if getattr(args, attr) is None:
+            setattr(args, attr, cfg.get(ckey, dflt))
+        elif isinstance(getattr(args, attr), str) and ckey.endswith("keywords"):
+            setattr(args, attr, [x.strip() for x in getattr(args, attr).split(",")])
+    # alias biar classify() bisa pakai nama penuh
+    args.good_keywords = args.good_kw
+    args.bad_keywords = args.bad_kw
+
+    if args.pick:
+        args.template = pick_template(cfg, key)
+
+    {
+        "templates": cmd_templates,
+        "pods": cmd_pods,
+        "deploy": cmd_deploy,
+        "rent": cmd_rent,
+        "verify": cmd_verify,
+        "terminate": cmd_terminate,
+        "logs": cmd_logs,
+        "stop": cmd_stop,
+    }[args.cmd](args, key, cfg)
+
+
+if __name__ == "__main__":
+    main()

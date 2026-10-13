@@ -1,0 +1,25 @@
+{
+  "accounts": {
+    "akun1": "ISI_API_KEY_RUNPOD_1",
+    "akun2": "ISI_API_KEY_RUNPOD_2"
+  },
+  "default_account": "akun1",
+
+  "gpu_type_id": "NVIDIA GeForce RTX 5090",
+  "cloud_type": "COMMUNITY",
+  "template_id": "ISI_TEMPLATE_ID",
+  "count": 10,
+  "name_prefix": "prl",
+
+  "stale_seconds": 300,
+  "deploys_per_round": 3,
+  "container_disk_gb": 20,
+  "min_vcpu": 4,
+  "min_memory_gb": 16,
+
+  "good_keywords": ["TH/s", "Accepted"],
+  "bad_keywords": [
+    "Failed to find OpenCL platform",
+    "clGetPlatformIDs"
+  ]
+}

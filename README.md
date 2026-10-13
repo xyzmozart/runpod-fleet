@@ -38,6 +38,15 @@ Edit `config.json`:
 ## Perintah
 
 ```bash
+# MODE WIZARD (disarankan) — satu command, sisanya lewat menu interaktif
+python3 fleet.py
+#  1) Sewa pod baru (scan template dari akun kamu, pilih GPU/cloud/target)
+#  2) Verifikasi semua pod (GOOD/BAD)
+#  3) Buang semua pod jelek
+#  4) Lihat daftar pod / 5) template
+#  6) Setel GPU/cloud/prefix/target   7) Ganti akun   0) Keluar
+
+# mode manual (tetap ada):
 # daftar template milik akun
 python3 fleet.py templates --account akun1
 

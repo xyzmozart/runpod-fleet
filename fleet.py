@@ -3,6 +3,7 @@
 runpod-fleet — sewa & jaga pod RunPod otomatis (stdlib only, no deps).
 
 Commands:
+  wizard      mode interaktif (default kalau tanpa subcommand)
   templates   daftar template milik akun
   pods        daftar pod
   deploy      sewa N pod sekarang (sekali jalan)
@@ -13,10 +14,9 @@ Commands:
   stop        hentikan proses rent yang jalan di background
 
 Contoh:
+  python fleet.py                        # wizard interaktif
   python fleet.py templates --account main
   python fleet.py rent --account main --count 10 --pick
-  python fleet.py verify --account main
-  python fleet.py terminate --account main --prefix prl- --only-bad
   python fleet.py stop
 
 Semua opsi ditaruh DI BELAKANG subcommand.
@@ -358,6 +358,193 @@ def cmd_stop(args, key, cfg):
     remove_pidfile()
 
 
+# ---------------------------------------------------------------- wizard
+
+
+def apply_defaults(args, cfg):
+    for attr, ckey, dflt in [
+        ("gpu", "gpu_type_id", "NVIDIA GeForce RTX 5090"),
+        ("cloud", "cloud_type", "COMMUNITY"),
+        ("count", "count", 10),
+        ("prefix", "name_prefix", "prl"),
+        ("stale", "stale_seconds", 300),
+        ("batch", "deploys_per_round", 3),
+        ("disk", "container_disk_gb", 20),
+        ("min_vcpu", "min_vcpu", 4),
+        ("min_mem", "min_memory_gb", 16),
+        ("good_kw", "good_keywords", ["TH/s", "Accepted"]),
+        ("bad_kw", "bad_keywords",
+         ["Failed to find OpenCL platform", "clGetPlatformIDs"]),
+    ]:
+        if getattr(args, attr, None) is None:
+            setattr(args, attr, cfg.get(ckey, dflt))
+        elif isinstance(getattr(args, attr), str) and ckey.endswith("keywords"):
+            setattr(args, attr, [x.strip() for x in getattr(args, attr).split(",")])
+    args.good_keywords = args.good_kw
+    args.bad_keywords = args.bad_kw
+    return args
+
+
+def ask(prompt, default=None):
+    try:
+        s = input("%s%s: " % (prompt, " [%s]" % default if default is not None else "")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit("dibatalkan")
+    return s or ("" if default is None else str(default))
+
+
+def ask_int(prompt, default, lo=None, hi=None):
+    while True:
+        s = ask(prompt, default)
+        try:
+            v = int(s)
+        except ValueError:
+            print("  harus angka")
+            continue
+        if lo is not None and v < lo:
+            print("  minimal %d" % lo)
+            continue
+        if hi is not None and v > hi:
+            print("  maksimal %d" % hi)
+            continue
+        return v
+
+
+def ask_choice(prompt, choices, default=None):
+    """choices: list of (value, label). default = value."""
+    for i, (val, label) in enumerate(choices, 1):
+        print("  %d. %s" % (i, label))
+    idx = {val: i for i, (val, _) in enumerate(choices, 1)}
+    dflt = idx.get(default)
+    while True:
+        s = ask(prompt, dflt)
+        try:
+            v = int(s)
+        except ValueError:
+            if s in idx:
+                return s
+            print("  pilihan tidak valid")
+            continue
+        if 1 <= v <= len(choices):
+            return choices[v - 1][0]
+        print("  pilihan tidak valid")
+
+
+def wizard_subargs(args, cfg, **overrides):
+    ns = argparse.Namespace(**vars(args))
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return apply_defaults(ns, cfg)
+
+
+def cmd_wizard(args, key, cfg):
+    accounts = cfg.get("accounts") or {}
+    cur_account = args.account or cfg.get("default_account", "")
+    if not key and accounts:
+        cur_account = list(accounts)[0]
+        key = accounts[cur_account]
+    gpu = args.gpu or cfg.get("gpu_type_id", "NVIDIA GeForce RTX 5090")
+    cloud = args.cloud or cfg.get("cloud_type", "COMMUNITY")
+    prefix = args.prefix or cfg.get("name_prefix", "prl")
+    count = args.count or cfg.get("count", 10)
+
+    def clone(**ov):
+        ov.setdefault("gpu", gpu)
+        ov.setdefault("cloud", cloud)
+        ov.setdefault("prefix", prefix)
+        ov.setdefault("count", count)
+        ov.setdefault("template", args.template)
+        ov.setdefault("tag", args.tag)
+        ov.setdefault("key", key)
+        ov.setdefault("account", cur_account)
+        return wizard_subargs(args, cfg, **ov)
+
+    while True:
+        from collections import Counter
+        pods = my_pods(key) if key else []
+        st = dict(Counter(p["desiredStatus"] for p in pods)) or {}
+        print()
+        print("=" * 56)
+        print(" runpod-fleet wizard")
+        print(" akun   : %s" % (cur_account or "(tanpa config)"))
+        print(" pod    : %s" % (", ".join("%s=%d" % kv for kv in st.items()) or "kosong"))
+        print(" GPU    : %s (%s)" % (gpu, cloud))
+        print(" prefix : %s | target: %d GOOD" % (prefix, count))
+        print("=" * 56)
+        print("1) Sewa pod baru (rent otomatis + ganti yang rusak)")
+        print("2) Verifikasi semua pod (GOOD/BAD)")
+        print("3) Buang semua pod jelek (BAD/stale) sesuai prefix")
+        print("4) Lihat daftar pod")
+        print("5) Lihat daftar template")
+        print("6) Setel GPU / cloud / prefix / target")
+        print("7) Ganti akun")
+        print("0) Keluar")
+        c = ask("Pilih", "0")
+
+        if c == "1":
+            d = gql(key, "{ myself { podTemplates { id name containerDiskInGb } } }")
+            tmpls = (d.get("data") or {}).get("myself", {}).get("podTemplates") or []
+            if not tmpls:
+                print("Tidak ada template di akun ini — buat dulu di dashboard RunPod.")
+                continue
+            print("\nTemplate tersedia di akun kamu:")
+            for i, t in enumerate(tmpls, 1):
+                print("  %2d. %-42s %s (disk %sGB)" % (
+                    i, t["name"], t["id"], t.get("containerDiskInGb") or "?"))
+            ti = ask_int("Nomor template", 1, 1, len(tmpls))
+            tpl = tmpls[ti - 1]["id"]
+            g = ask("GPU type id", gpu)
+            cld = ask_choice("Cloud type", [
+                ("COMMUNITY", "COMMUNITY — murah, host kadang OpenCL rusak"),
+                ("SECURE", "SECURE — lebih mahal, host lebih stabil"),
+                ("ALL", "ALL — bebas"),
+            ], cloud)
+            n = ask_int("Target jumlah pod GOOD", count, 1, 500)
+            p = ask("Prefix nama pod", prefix)
+            print("\nRencana sewa:")
+            print("  template : %s (%s)" % (tpl, tmpls[ti - 1]["name"]))
+            print("  GPU      : %s | cloud: %s" % (g, cld))
+            print("  target   : %d GOOD | prefix: %s-%s" % (n, p, args.tag))
+            if ask("Mulai sekarang? (y/n)", "y").lower() != "y":
+                continue
+            gpu, cloud, prefix, count = g, cld, p, n
+            cmd_rent(clone(template=tpl), key, cfg)
+        elif c == "2":
+            cmd_verify(clone(), key, cfg)
+        elif c == "3":
+            cmd_terminate(clone(only_bad=True), key, cfg)
+        elif c == "4":
+            cmd_pods(clone(), key, cfg)
+        elif c == "5":
+            cmd_templates(clone(), key, cfg)
+        elif c == "6":
+            gpu = ask("GPU type id", gpu)
+            cloud = ask_choice("Cloud type", [
+                ("COMMUNITY", "COMMUNITY — murah"),
+                ("SECURE", "SECURE — stabil"),
+                ("ALL", "ALL — bebas"),
+            ], cloud)
+            prefix = ask("Prefix nama pod", prefix)
+            count = ask_int("Target GOOD", count, 1, 500)
+        elif c == "7":
+            if len(accounts) < 2:
+                print("Cuma ada %d akun di config.json." % len(accounts))
+                continue
+            names = list(accounts)
+            for i, n in enumerate(names, 1):
+                print("  %d. %s" % (i, n))
+            ai = ask_int("Pilih akun", 1, 1, len(names))
+            cur_account = names[ai - 1]
+            key = accounts[cur_account]
+            print("akun -> %s" % cur_account)
+        elif c == "0":
+            print("bye")
+            return
+        else:
+            print("pilihan tidak valid")
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -392,7 +579,9 @@ def main():
 
     ap = argparse.ArgumentParser(
         description="runpod-fleet: sewa & jaga pod RunPod otomatis")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("wizard", parents=[common],
+                   help="mode interaktif (default)")
     sub.add_parser("templates", parents=[common])
     sub.add_parser("pods", parents=[common])
     p = sub.add_parser("deploy", parents=[common])
@@ -409,6 +598,14 @@ def main():
     sub.add_parser("stop", parents=[common])
 
     args = ap.parse_args()
+    if args.cmd is None:
+        args.cmd = "wizard"  # tanpa subcommand = mode interaktif
+        # isi atribut dari parser common secara manual
+        for a in common._actions:
+            if not a.dest or a.dest == "help":
+                continue
+            if not hasattr(args, a.dest):
+                setattr(args, a.dest, a.default)
     if args.cmd == "stop":
         cmd_stop(args, None, {})  # stop tidak butuh config/API key
         return
@@ -425,36 +622,17 @@ def main():
 
     key = args.key or cfg.get("accounts", {}).get(
         args.account or cfg.get("default_account", ""))
-    if not key:
+    if not key and args.cmd != "wizard":
         sys.exit("API key tidak ada. Pakai --account NAMA, --key, "
                  "atau isi config.json (accounts/default_account).")
 
-    for attr, ckey, dflt in [
-        ("gpu", "gpu_type_id", "NVIDIA GeForce RTX 5090"),
-        ("cloud", "cloud_type", "COMMUNITY"),
-        ("count", "count", 10),
-        ("prefix", "name_prefix", "prl"),
-        ("stale", "stale_seconds", 300),
-        ("batch", "deploys_per_round", 3),
-        ("disk", "container_disk_gb", 20),
-        ("min_vcpu", "min_vcpu", 4),
-        ("min_mem", "min_memory_gb", 16),
-        ("good_kw", "good_keywords", ["TH/s", "Accepted"]),
-        ("bad_kw", "bad_keywords",
-         ["Failed to find OpenCL platform", "clGetPlatformIDs"]),
-    ]:
-        if getattr(args, attr) is None:
-            setattr(args, attr, cfg.get(ckey, dflt))
-        elif isinstance(getattr(args, attr), str) and ckey.endswith("keywords"):
-            setattr(args, attr, [x.strip() for x in getattr(args, attr).split(",")])
-    # alias biar classify() bisa pakai nama penuh
-    args.good_keywords = args.good_kw
-    args.bad_keywords = args.bad_kw
+    apply_defaults(args, cfg)
 
     if args.pick:
         args.template = pick_template(cfg, key)
 
     {
+        "wizard": cmd_wizard,
         "templates": cmd_templates,
         "pods": cmd_pods,
         "deploy": cmd_deploy,

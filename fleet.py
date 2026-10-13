@@ -48,6 +48,20 @@ def load_config(path):
         return json.load(f)
 
 
+def save_config(path, cfg):
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+def myself_email(key):
+    d = gql(key, "{ myself { email } }")
+    try:
+        return d["data"]["myself"]["email"] or ""
+    except Exception:
+        return ""
+
+
 def pick_template(cfg, key):
     tmpls = user_templates(key)
     if not tmpls:
@@ -463,6 +477,12 @@ def cmd_wizard(args, key, cfg):
     cloud = args.cloud or cfg.get("cloud_type", "COMMUNITY")
     prefix = args.prefix or cfg.get("name_prefix", "prl")
     count = args.count or cfg.get("count", 10)
+    email_cache = {}
+
+    def acct_label(name):
+        if name not in email_cache:
+            email_cache[name] = myself_email(accounts[name]) or "?"
+        return "%s  <%s>" % (name, email_cache[name])
 
     def clone(**ov):
         ov.setdefault("gpu", gpu)
@@ -482,7 +502,7 @@ def cmd_wizard(args, key, cfg):
         print()
         print("=" * 56)
         print(" runpod-fleet wizard")
-        print(" akun   : %s" % (cur_account or "(tanpa config)"))
+        print(" akun   : %s" % (acct_label(cur_account) if cur_account in accounts else (cur_account or "(tanpa config)")))
         print(" pod    : %s" % (", ".join("%s=%d" % kv for kv in st.items()) or "kosong"))
         print(" GPU    : %s (%s)" % (gpu, cloud))
         print(" prefix : %s | target: %d GOOD" % (prefix, count))
@@ -494,6 +514,7 @@ def cmd_wizard(args, key, cfg):
         print("5) Lihat daftar template")
         print("6) Setel GPU / cloud / prefix / target")
         print("7) Ganti akun")
+        print("8) Tambah akun baru (tempel API key)")
         print("0) Keluar")
         c = ask("Pilih", "0")
 
@@ -542,16 +563,39 @@ def cmd_wizard(args, key, cfg):
             prefix = ask("Prefix nama pod", prefix)
             count = ask_int("Target GOOD", count, 1, 500)
         elif c == "7":
-            if len(accounts) < 2:
-                print("Cuma ada %d akun di config.json." % len(accounts))
+            if not accounts:
+                print("Belum ada akun di config.json.")
                 continue
             names = list(accounts)
             for i, n in enumerate(names, 1):
-                print("  %d. %s" % (i, n))
-            ai = ask_int("Pilih akun", 1, 1, len(names))
+                mark = " (aktif)" if n == cur_account else ""
+                print("  %d. %s%s" % (i, acct_label(n), mark))
+            ai = ask_int("Pilih akun", names.index(cur_account) + 1 if cur_account in names else 1,
+                         1, len(names))
             cur_account = names[ai - 1]
             key = accounts[cur_account]
-            print("akun -> %s" % cur_account)
+            cfg["default_account"] = cur_account  # biar konsisten
+            print("akun -> %s" % acct_label(cur_account))
+        elif c == "8":
+            print("Tempel API key RunPod (rpa_...).")
+            new_key = ask("API key").strip()
+            if not new_key:
+                print("dibatalkan")
+                continue
+            print("memvalidasi...")
+            em = myself_email(new_key)
+            if not em:
+                print("API key tidak valid atau jaringan bermasalah — tidak disimpan.")
+                continue
+            default_name = em.split("@")[0]
+            new_name = ask("Nama akun (label)", default_name).strip() or default_name
+            accounts[new_name] = new_key
+            cfg.setdefault("accounts", {})[new_name] = new_key
+            cfg["default_account"] = new_name
+            save_config(args.config, cfg)
+            cur_account = new_name
+            key = new_key
+            print("tersimpan: %s <%s> -> %s" % (new_name, em, args.config))
         elif c == "0":
             print("bye")
             return

@@ -44,7 +44,10 @@ python3 fleet.py
 #  2) Verifikasi semua pod (GOOD/BAD)
 #  3) Buang semua pod jelek
 #  4) Lihat daftar pod / 5) template
-#  6) Setel GPU/cloud/prefix/target   7) Ganti akun   0) Keluar
+#  6) Setel GPU/cloud/prefix/target
+#  7) Ganti akun (tampil label + email)
+#  8) Tambah akun baru (tempel API key, otomatis disimpan ke config.json)
+#  0) Keluar
 
 # mode manual (tetap ada):
 # daftar template milik akun

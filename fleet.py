@@ -49,8 +49,9 @@ def load_config(path):
 
 
 def pick_template(cfg, key):
-    tmpls = gql(key, "{ myself { podTemplates { id name imageName } } }")[
-        "data"]["myself"]["podTemplates"]
+    tmpls = user_templates(key)
+    if not tmpls:
+        sys.exit("Tidak ada template custom di akun ini.")
     for i, t in enumerate(tmpls, 1):
         print("%3d. %-45s %s  (%s)" % (i, t["name"], t["id"], t["imageName"]))
     ans = input("Pilih nomor template: ").strip()
@@ -173,9 +174,23 @@ def log(msg):
 # ---------------------------------------------------------------- commands
 
 
-def cmd_templates(args, key, cfg):
+def user_templates(key, show_all=False):
+    """Template di akun. Default: sembunyikan template bawaan RunPod
+    (image runpod/* dan filebrowser/*), sisanya = punya user sendiri."""
     d = gql(key, "{ myself { podTemplates { id name imageName containerDiskInGb } } }")
-    for t in d["data"]["myself"]["podTemplates"]:
+    tmpls = (d.get("data") or {}).get("myself", {}).get("podTemplates") or []
+    if not show_all:
+        tmpls = [t for t in tmpls
+                 if not (t.get("imageName") or "").startswith(("runpod/", "filebrowser/"))]
+    return tmpls
+
+
+def cmd_templates(args, key, cfg):
+    tmpls = user_templates(key, show_all=getattr(args, "all_templates", False))
+    if not tmpls:
+        print("(tidak ada template custom; pakai --all untuk lihat bawaan RunPod)")
+        return
+    for t in tmpls:
         print("%-12s %-45s %s" % (t["id"], t["name"], t["imageName"]))
 
 
@@ -483,10 +498,9 @@ def cmd_wizard(args, key, cfg):
         c = ask("Pilih", "0")
 
         if c == "1":
-            d = gql(key, "{ myself { podTemplates { id name containerDiskInGb } } }")
-            tmpls = (d.get("data") or {}).get("myself", {}).get("podTemplates") or []
+            tmpls = user_templates(key)
             if not tmpls:
-                print("Tidak ada template di akun ini — buat dulu di dashboard RunPod.")
+                print("Tidak ada template custom di akun ini — buat dulu di dashboard RunPod.")
                 continue
             print("\nTemplate tersedia di akun kamu:")
             for i, t in enumerate(tmpls, 1):
@@ -582,7 +596,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("wizard", parents=[common],
                    help="mode interaktif (default)")
-    sub.add_parser("templates", parents=[common])
+    p = sub.add_parser("templates", parents=[common])
+    p.add_argument("--all", action="store_true", dest="all_templates",
+                   help="tampilkan juga template bawaan RunPod")
     sub.add_parser("pods", parents=[common])
     p = sub.add_parser("deploy", parents=[common])
     p.add_argument("-n", type=int, dest="n",

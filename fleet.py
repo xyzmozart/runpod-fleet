@@ -137,8 +137,8 @@ def deploy(key, tpl, args, name):
     q = ('mutation { podFindAndDeployOnDemand(input: {'
          'cloudType: %s, gpuCount: 1, gpuTypeId: "%s", name: "%s", '
          'templateId: "%s", volumeInGb: 0, containerDiskInGb: %d, '
-         'minVcpuCount: %d, minMemoryInGb: %d, ports: "22/tcp"'
-         ') { id desiredStatus costPerHr } }' % (
+         'minVcpuCount: %d, minMemoryInGb: %d, ports: "22/tcp"})'
+         ' { id desiredStatus costPerHr } }' % (
              args.cloud, args.gpu, name, tpl,
              args.disk, args.min_vcpu, args.min_mem))
     d = gql(key, q)

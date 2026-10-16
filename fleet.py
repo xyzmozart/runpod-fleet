@@ -24,6 +24,7 @@ Semua opsi ditaruh DI BELAKANG subcommand.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -156,22 +157,81 @@ def terminate(key, pid):
 
 # ---------------------------------------------------------------- verdict
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_UNIT_TH = {"kh": 1e-9, "mh": 1e-6, "gh": 1e-3, "th": 1.0, "ph": 1e3,
+            "h": 1e-12}
+# SRBMiner: "1 min    350.21 TH/s" / "Hashrate    350.39 TH/s"
+_SRB_1MIN = re.compile(r"\b1 min\s+([0-9]+(?:\.[0-9]+)?)\s*([kMGT]?H)/s", re.I)
+_SRB_HASH = re.compile(r"\bHashrate\s+([0-9]+(?:\.[0-9]+)?)\s*([kMGT]?H)/s", re.I)
+# WildRig: "speed 10s/60s/15m 384 385 n/a TH/s max: 390 TH/s"
+_WRG_SPEED = re.compile(
+    r"\bspeed 10s/60s/15m\s+(\S+)\s+(\S+)\s+(\S+)\s+([kMGT]?H)/s", re.I)
+# fallback generik: angka + satuan H/s terakhir di log
+_ANY_HR = re.compile(r"\b([0-9]+(?:\.[0-9]+)?)\s*([kMGT]?H)/s\b", re.I)
+
+
+def _to_th(value, unit):
+    return value * _UNIT_TH.get(unit.lower(), 1.0)
+
+
+def parse_hashrate_ths(lines):
+    """Ambil hashrate (dalam TH/s) dari logs miner. None = tak terbaca.
+    Utamakan rata-rata (1 min / 60s) biar nggak false-positive gara-gara
+    drop sekejap."""
+    txt = [_ANSI_RE.sub("", l) for l in lines]
+    # 1) SRBMiner "1 min"
+    for l in reversed(txt):
+        m = _SRB_1MIN.search(l)
+        if m:
+            return _to_th(float(m.group(1)), m.group(2))
+    # 2) WildRig "speed 10s/60s/15m" -> pakai nilai 60s (fallback 10s/15m)
+    for l in reversed(txt):
+        m = _WRG_SPEED.search(l)
+        if m:
+            for tok in (m.group(2), m.group(1), m.group(3)):
+                if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", tok):
+                    return _to_th(float(tok), m.group(4))
+    # 3) SRBMiner baris "Hashrate NNN TH/s"
+    for l in reversed(txt):
+        m = _SRB_HASH.search(l)
+        if m:
+            return _to_th(float(m.group(1)), m.group(2))
+    # 4) fallback: angka+satuan terakhir yang terbaca
+    hr = None
+    for l in txt:
+        for m in _ANY_HR.finditer(l):
+            hr = _to_th(float(m.group(1)), m.group(2))
+    return hr
+
 
 def classify(key, pid, args):
-    """GOOD | BAD | PENDING"""
+    """-> (verdict, hashrate_ths). verdict: GOOD | BAD | LOW | PENDING"""
     lines = pod_logs(key, pid, wait=args.log_wait)
     txt = "\n".join(lines)
+    hr = parse_hashrate_ths(lines)
+    verdict = "PENDING"
     for kw in args.bad_keywords:
         if kw in txt:
-            return "BAD"
-    for kw in args.good_keywords:
-        if kw in txt:
-            return "GOOD"
-    if txt.count("exit code") >= 2:
-        return "BAD"
-    if not lines:
-        return "PENDING"
-    return "PENDING"
+            verdict = "BAD"
+            break
+    if verdict == "PENDING":
+        for kw in args.good_keywords:
+            if kw in txt:
+                verdict = "GOOD"
+                break
+    if verdict == "PENDING" and txt.count("exit code") >= 2:
+        verdict = "BAD"
+    # pantau hashrate: GOOD tapi di bawah ambang -> LOW (dibuang saat rent)
+    if verdict == "GOOD" and args.min_hashrate and hr is not None \
+            and hr < args.min_hashrate:
+        up = (pod_runtime(key, pid) or {}).get("uptimeInSeconds") or 0
+        if up > args.stale:
+            verdict = "LOW"
+    return verdict, hr
+
+
+def hr_str(hr):
+    return "-" if hr is None else "%.1f" % hr
 
 
 def is_stale(key, pid, stale_seconds):
@@ -249,21 +309,25 @@ def cmd_verify(args, key, cfg):
     pods = [p for p in my_pods(key) if p["desiredStatus"] == "RUNNING"]
     if args.prefix:
         pods = [p for p in pods if p["name"].startswith(args.prefix)]
-    results = {"GOOD": [], "BAD": [], "PENDING": []}
+    results = {"GOOD": [], "BAD": [], "LOW": [], "PENDING": []}
 
     def check(p):
-        st = classify(key, p["id"], args)
+        st, hr = classify(key, p["id"], args)
         rt = pod_runtime(key, p["id"])
         util = [g.get("gpuUtilPercent") for g in (rt.get("gpus") or [])]
-        return p, st, util
+        return p, st, hr, util
 
     with ThreadPoolExecutor(args.concurrency) as ex:
-        for p, st, util in ex.map(check, pods):
-            print("%-24s %-18s %-8s util=%s" % (p["name"], p["id"], st, util))
+        for p, st, hr, util in ex.map(check, pods):
+            print("%-24s %-18s %-8s hr=%-7s util=%s" % (
+                p["name"], p["id"], st, hr_str(hr), util))
             results[st].append(p)
-    print("\nGOOD=%d BAD=%d PENDING=%d TOTAL=%d" % (
-        len(results["GOOD"]), len(results["BAD"]),
+    print("\nGOOD=%d LOW=%d BAD=%d PENDING=%d TOTAL=%d" % (
+        len(results["GOOD"]), len(results["LOW"]), len(results["BAD"]),
         len(results["PENDING"]), len(pods)))
+    if args.min_hashrate:
+        print("(ambang hashrate: %g TH/s — LOW = di bawah ambang, "
+              "akan dibuang saat rent)" % args.min_hashrate)
 
 
 def cmd_terminate(args, key, cfg):
@@ -276,7 +340,8 @@ def cmd_terminate(args, key, cfg):
             if args.prefix and not p["name"].startswith(args.prefix):
                 continue
             if args.only_bad and p["desiredStatus"] == "RUNNING":
-                if classify(key, p["id"], args) != "BAD":
+                st, hr = classify(key, p["id"], args)
+                if st not in ("BAD", "LOW"):
                     continue
             targets.append(p)
     for p in targets:
@@ -300,8 +365,9 @@ def cmd_rent(args, key, cfg):
     target = args.count
     prefix = args.prefix
     counter = 0
-    log("rent dimulai: target=%d GOOD, template=%s, prefix=%s-%s" % (
-        target, tpl, prefix, args.tag))
+    log("rent dimulai: target=%d GOOD, template=%s, prefix=%s-%s, "
+        "min_hr=%g TH/s" % (
+            target, tpl, prefix, args.tag, args.min_hashrate or 0))
     write_pidfile(args)
     try:
         while True:
@@ -311,14 +377,19 @@ def cmd_rent(args, key, cfg):
             good, bad, pending = [], [], []
 
             def check(p):
-                return p, classify(key, p["id"], args)
+                st, hr = classify(key, p["id"], args)
+                return p, st, hr
 
             with ThreadPoolExecutor(args.concurrency) as ex:
-                for p, st in ex.map(check, pods):
-                    log("CHECK %s %s -> %s" % (p["id"], p["name"], st))
+                for p, st, hr in ex.map(check, pods):
+                    log("CHECK %s %s -> %s hr=%s" % (
+                        p["id"], p["name"], st, hr_str(hr)))
                     if st == "GOOD":
                         good.append(p)
-                    elif st == "BAD":
+                    elif st in ("BAD", "LOW"):
+                        if st == "LOW":
+                            log("  LOW hashrate %s TH/s < %g -> dibuang" % (
+                                hr_str(hr), args.min_hashrate))
                         bad.append(p)
                     else:
                         if is_stale(key, p["id"], args.stale):
@@ -397,6 +468,7 @@ def apply_defaults(args, cfg):
         ("count", "count", 10),
         ("prefix", "name_prefix", "prl"),
         ("stale", "stale_seconds", 300),
+        ("min_hashrate", "min_hashrate_ths", 300),
         ("batch", "deploys_per_round", 3),
         ("disk", "container_disk_gb", 20),
         ("min_vcpu", "min_vcpu", 4),
@@ -477,6 +549,8 @@ def cmd_wizard(args, key, cfg):
     cloud = args.cloud or cfg.get("cloud_type", "COMMUNITY")
     prefix = args.prefix or cfg.get("name_prefix", "prl")
     count = args.count or cfg.get("count", 10)
+    min_hr = args.min_hashrate if getattr(args, "min_hashrate", None) is not None \
+        else cfg.get("min_hashrate_ths", 300)
     email_cache = {}
 
     def acct_label(name):
@@ -489,6 +563,7 @@ def cmd_wizard(args, key, cfg):
         ov.setdefault("cloud", cloud)
         ov.setdefault("prefix", prefix)
         ov.setdefault("count", count)
+        ov.setdefault("min_hashrate", min_hr)
         ov.setdefault("template", args.template)
         ov.setdefault("tag", args.tag)
         ov.setdefault("key", key)
@@ -506,13 +581,14 @@ def cmd_wizard(args, key, cfg):
         print(" pod    : %s" % (", ".join("%s=%d" % kv for kv in st.items()) or "kosong"))
         print(" GPU    : %s (%s)" % (gpu, cloud))
         print(" prefix : %s | target: %d GOOD" % (prefix, count))
+        print(" min HR : %g TH/s (0 = mati)" % min_hr)
         print("=" * 56)
         print("1) Sewa pod baru (rent otomatis + ganti yang rusak)")
-        print("2) Verifikasi semua pod (GOOD/BAD)")
-        print("3) Buang semua pod jelek (BAD/stale) sesuai prefix")
+        print("2) Verifikasi semua pod (GOOD/LOW/BAD)")
+        print("3) Buang semua pod jelek (BAD/LOW/stale) sesuai prefix")
         print("4) Lihat daftar pod")
         print("5) Lihat daftar template")
-        print("6) Setel GPU / cloud / prefix / target")
+        print("6) Setel GPU / cloud / prefix / target / min hashrate")
         print("7) Ganti akun")
         print("8) Tambah akun baru (tempel API key)")
         print("0) Keluar")
@@ -537,13 +613,15 @@ def cmd_wizard(args, key, cfg):
             ], cloud)
             n = ask_int("Target jumlah pod GOOD", count, 1, 500)
             p = ask("Prefix nama pod", prefix)
+            mh = ask_int("Min hashrate TH/s (0 = mati)", min_hr, 0, 10 ** 7)
             print("\nRencana sewa:")
             print("  template : %s (%s)" % (tpl, tmpls[ti - 1]["name"]))
             print("  GPU      : %s | cloud: %s" % (g, cld))
             print("  target   : %d GOOD | prefix: %s-%s" % (n, p, args.tag))
+            print("  min HR   : %s TH/s" % (mh if mh else "mati"))
             if ask("Mulai sekarang? (y/n)", "y").lower() != "y":
                 continue
-            gpu, cloud, prefix, count = g, cld, p, n
+            gpu, cloud, prefix, count, min_hr = g, cld, p, n, mh
             cmd_rent(clone(template=tpl), key, cfg)
         elif c == "2":
             cmd_verify(clone(), key, cfg)
@@ -562,6 +640,7 @@ def cmd_wizard(args, key, cfg):
             ], cloud)
             prefix = ask("Prefix nama pod", prefix)
             count = ask_int("Target GOOD", count, 1, 500)
+            min_hr = ask_int("Min hashrate TH/s (0 = mati)", min_hr, 0, 10 ** 7)
         elif c == "7":
             if not accounts:
                 print("Belum ada akun di config.json.")
@@ -620,6 +699,9 @@ def main():
     common.add_argument("--prefix", help="prefix nama pod, mis. prl")
     common.add_argument("--stale", type=int, dest="stale",
                         help="detik sebelum pod tanpa GPU dianggap rusak")
+    common.add_argument("--min-hashrate", dest="min_hashrate", type=float,
+                        help="terminate pod GOOD dengan hashrate < ambang "
+                             "TH/s (0 = mati, default dari config/300)")
     common.add_argument("--batch", type=int, help="deploy per ronde")
     common.add_argument("--disk", type=int, help="container disk GB")
     common.add_argument("--min-vcpu", dest="min_vcpu", type=int)

@@ -12,6 +12,7 @@
   "name_prefix": "prl",
 
   "stale_seconds": 300,
+  "min_hashrate_ths": 300,
   "deploys_per_round": 3,
   "container_disk_gb": 20,
   "min_vcpu": 4,

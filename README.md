@@ -81,8 +81,30 @@ python3 fleet.py stop
 1. Sewa pod (`podFindAndDeployOnDemand`) — kalau supply habis, auto-retry
 2. Tiap ronde: cek logs semua pod (paralel)
 3. Ada **GOOD** → dipertahankan  
-   ada **BAD** (kata kunci) atau GPU util <5% selama `stale_seconds` → di-terminate & diganti
+   ada **BAD** (kata kunci), **LOW** (hashrate < ambang), atau GPU util <5% selama `stale_seconds` → di-terminate & diganti
 4. Berhenti otomatis kalau jumlah GOOD ≥ `count`
+
+## Pantau hashrate (auto-terminate pod lemah)
+
+Script parse hashrate dari logs miner (SRBMiner `1 min NNN TH/s`, WildRig
+`speed 10s/60s/15m ...`) dan normalisasi ke TH/s. Kalau GOOD tapi hashrate
+di bawah ambang → verdict **LOW** → dibuang & diganti saat rent.
+
+```json
+"min_hashrate_ths": 300
+```
+
+```bash
+python3 fleet.py verify            # tampil hr=350.2 per pod
+python3 fleet.py rent --min-hashrate 300
+python3 fleet.py rent --min-hashrate 0    # matikan pantauan
+```
+
+- Grace period: cek hanya jalan setelah uptime > `stale_seconds` (300s),
+  pod yang lagi warm-up/download nggak salah dibunuh.
+- **Sesuaikan ambang dengan GPU/miner**: 300 TH/s itu buat RTX 5090 +
+  SRBMiner/WildRig pearlhash. Miner/GPU lain bisa beda jauh — kalau nggak
+  yakin, `0` dulu, lihat angka riil di `verify`, baru set.
 
 ## Sesuaikan miner lain
 
